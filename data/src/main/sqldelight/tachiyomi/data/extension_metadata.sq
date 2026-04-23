@@ -1,0 +1,58 @@
+import kotlin.Boolean;
+
+CREATE TABLE extension_metadata (
+    pkg_name TEXT NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL,
+    version_name TEXT NOT NULL,
+    version_code INTEGER NOT NULL,
+    lib_version REAL NOT NULL,
+    signature_hash TEXT NOT NULL,
+    is_nsfw INTEGER AS Boolean NOT NULL,
+    is_shared INTEGER AS Boolean NOT NULL,
+    repo_name TEXT,
+    pkg_factory TEXT,
+    last_modified INTEGER NOT NULL
+);
+
+CREATE TABLE extension_sources (
+    pkg_name TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    lang TEXT NOT NULL,
+    class_name TEXT NOT NULL,
+    PRIMARY KEY (pkg_name, source_id),
+    FOREIGN KEY (pkg_name) REFERENCES extension_metadata(pkg_name) ON DELETE CASCADE
+);
+
+findAllMetadata:
+SELECT *
+FROM extension_metadata;
+
+findMetadataByPkgName:
+SELECT *
+FROM extension_metadata
+WHERE pkg_name = :pkgName;
+
+findSourcesByPkgName:
+SELECT *
+FROM extension_sources
+WHERE pkg_name = :pkgName;
+
+findAllSources:
+SELECT *
+FROM extension_sources;
+
+insertMetadata:
+INSERT OR REPLACE INTO extension_metadata(pkg_name, name, version_name, version_code, lib_version, signature_hash, is_nsfw, is_shared, repo_name, pkg_factory, last_modified)
+VALUES (:pkgName, :name, :versionName, :versionCode, :libVersion, :signatureHash, :isNsfw, :isShared, :repoName, :pkgFactory, :lastModified);
+
+insertSource:
+INSERT OR REPLACE INTO extension_sources(pkg_name, source_id, name, lang, class_name)
+VALUES (:pkgName, :sourceId, :name, :lang, :className);
+
+deleteMetadata:
+DELETE FROM extension_metadata
+WHERE pkg_name = :pkgName;
+
+deleteAllMetadata:
+DELETE FROM extension_metadata;

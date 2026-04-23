@@ -7,6 +7,9 @@ import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.pm.PackageInfoCompat
 import eu.kanade.domain.extension.interactor.TrustExtension
+import eu.kanade.domain.extension.model.ExtensionMetadata
+import eu.kanade.domain.extension.model.ExtensionSource
+import eu.kanade.domain.extension.repository.ExtensionMetadataRepository
 import eu.kanade.domain.source.service.SourcePreferences
 import eu.kanade.tachiyomi.extension.model.Extension
 import eu.kanade.tachiyomi.extension.model.LoadResult
@@ -16,9 +19,12 @@ import eu.kanade.tachiyomi.source.SourceFactory
 import eu.kanade.tachiyomi.util.lang.Hash
 import eu.kanade.tachiyomi.util.storage.copyAndSetReadOnlyTo
 import eu.kanade.tachiyomi.util.system.ChildFirstPathClassLoader
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import logcat.LogPriority
 import mihon.domain.extensionrepo.interactor.GetExtensionRepo
 import mihon.domain.extensionrepo.model.ExtensionRepo
@@ -47,6 +53,7 @@ internal object ExtensionLoader {
 
     // KMK -->
     private val getExtensionRepo: GetExtensionRepo by injectLazy()
+    private val extensionMetadataRepository: ExtensionMetadataRepository by injectLazy()
     // KMK <--
 
     private val loadNsfwSource by lazy {
@@ -121,7 +128,7 @@ internal object ExtensionLoader {
      *
      * @param context The application context.
      */
-    fun loadExtensions(context: Context): List<LoadResult> {
+    suspend fun loadExtensions(context: Context): List<LoadResult> = withContext(Dispatchers.IO) {
         val pkgManager = context.packageManager
 
         val installedPkgs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -133,7 +140,7 @@ internal object ExtensionLoader {
         val sharedExtPkgs = installedPkgs
             .asSequence()
             .filter { isPackageAnExtension(it) }
-            .map { ExtensionInfo(packageInfo = it, isShared = true) }
+            .map { ExtensionInfo(packageInfo = it, isShared = true, lastModified = File(it.applicationInfo!!.sourceDir).lastModified()) }
 
         val privateExtPkgs = getPrivateExtensionDir(context)
             .listFiles()
@@ -148,9 +155,11 @@ internal object ExtensionLoader {
                 val path = it.absolutePath
                 pkgManager.getPackageArchiveInfo(path, PACKAGE_FLAGS)
                     ?.apply { applicationInfo!!.fixBasePaths(path) }
+                    ?.let { pkgInfo ->
+                        ExtensionInfo(packageInfo = pkgInfo, isShared = false, lastModified = it.lastModified())
+                    }
             }
-            ?.filter { isPackageAnExtension(it) }
-            ?.map { ExtensionInfo(packageInfo = it, isShared = false) }
+            ?.filter { isPackageAnExtension(it.packageInfo) }
             ?: emptySequence()
 
         val extPkgs = (sharedExtPkgs + privateExtPkgs)
@@ -164,26 +173,18 @@ internal object ExtensionLoader {
             }
             .toList()
 
-        if (extPkgs.isEmpty()) return emptyList()
+        if (extPkgs.isEmpty()) return@withContext emptyList()
 
-        // Load each extension concurrently and wait for completion
-        return runBlocking {
-            // KMK -->
-            val extRepos = getExtensionRepo.getAll()
-            // KMK <--
-            val deferred = extPkgs.map {
-                async {
-                    loadExtension(
-                        context,
-                        it,
-                        // KMK -->
-                        extRepos,
-                        // KMK <--
-                    )
+        val extRepos = getExtensionRepo.getAll()
+        val semaphore = Semaphore(5)
+
+        extPkgs.map { extensionInfo ->
+            async {
+                semaphore.withPermit {
+                    loadExtension(context, extensionInfo, extRepos)
                 }
             }
-            deferred.awaitAll()
-        }
+        }.awaitAll()
     }
 
     /**
@@ -213,6 +214,7 @@ internal object ExtensionLoader {
                     ExtensionInfo(
                         packageInfo = it,
                         isShared = false,
+                        lastModified = privateExtensionFile.lastModified(),
                     )
                 }
         } else {
@@ -226,6 +228,7 @@ internal object ExtensionLoader {
                     ExtensionInfo(
                         packageInfo = it,
                         isShared = true,
+                        lastModified = File(it.applicationInfo!!.sourceDir).lastModified(),
                     )
                 }
         } catch (error: PackageManager.NameNotFoundException) {
@@ -244,13 +247,106 @@ internal object ExtensionLoader {
     private suspend fun loadExtension(
         context: Context,
         extensionInfo: ExtensionInfo,
-        // KMK -->
         extRepos: List<ExtensionRepo>? = null,
-        // KMK <--
     ): LoadResult {
-        // KMK -->
+        val pkgInfo = extensionInfo.packageInfo
+        val pkgName = pkgInfo.packageName
+
+        val cachedMetadata = extensionMetadataRepository.getMetadataByPkgName(pkgName)
+        if (cachedMetadata != null &&
+            cachedMetadata.versionCode == PackageInfoCompat.getLongVersionCode(pkgInfo) &&
+            cachedMetadata.lastModified == extensionInfo.lastModified &&
+            cachedMetadata.isShared == extensionInfo.isShared
+        ) {
+            return loadExtensionFromMetadata(context, extensionInfo, cachedMetadata, extRepos)
+        }
+
+        return loadExtensionFromPkg(context, extensionInfo, extRepos)
+    }
+
+    private suspend fun loadExtensionFromMetadata(
+        context: Context,
+        extensionInfo: ExtensionInfo,
+        metadata: ExtensionMetadata,
+        extRepos: List<ExtensionRepo>?,
+    ): LoadResult {
+        val pkgInfo = extensionInfo.packageInfo
+        val pkgName = metadata.pkgName
+
+        val signatures = getSignatures(pkgInfo)
+        if (signatures.isNullOrEmpty()) {
+            logcat(LogPriority.WARN) { "Package $pkgName isn't signed" }
+            return LoadResult.Error
+        } else if (!trustExtension.isTrusted(pkgInfo, signatures)) {
+            val extension = Extension.Untrusted(
+                metadata.name,
+                pkgName,
+                metadata.versionName,
+                metadata.versionCode,
+                metadata.libVersion,
+                signatures.last(),
+                repoName = metadata.repoName,
+            )
+            logcat(LogPriority.WARN) { "Extension $pkgName isn't trusted" }
+            return LoadResult.Untrusted(extension)
+        }
+
+        if (!loadNsfwSource && metadata.isNsfw) {
+            logcat(LogPriority.WARN) { "NSFW extension $pkgName not allowed" }
+            return LoadResult.Error
+        }
+
+        val sources = metadata.sources.map { source ->
+            val loadActualSource = {
+                val classLoader = ChildFirstPathClassLoader(pkgInfo.applicationInfo!!.sourceDir, null, context.classLoader)
+                val obj = Class.forName(source.className, false, classLoader).getDeclaredConstructor().newInstance()
+                if (obj is SourceFactory) {
+                    obj.createSources().first { it.id == source.sourceId }
+                } else {
+                    obj as Source
+                }
+            }
+
+            if (source.className.contains("HttpSource") || source.className.contains("ParsedHttpSource")) {
+                LazyHttpSource(source.sourceId, source.name, source.lang, loadActualSource)
+            } else {
+                LazyCatalogueSource(source.sourceId, source.name, source.lang, loadActualSource)
+            }
+        }
+
+        val langs = sources.filterIsInstance<CatalogueSource>()
+            .map { it.lang }
+            .toSet()
+        val lang = when (langs.size) {
+            0 -> ""
+            1 -> langs.first()
+            else -> "all"
+        }
+
+        val extension = Extension.Installed(
+            name = metadata.name,
+            pkgName = pkgName,
+            versionName = metadata.versionName,
+            versionCode = metadata.versionCode,
+            libVersion = metadata.lib_version,
+            lang = lang,
+            isNsfw = metadata.is_nsfw,
+            sources = sources,
+            pkgFactory = metadata.pkgFactory,
+            icon = pkgInfo.applicationInfo!!.loadIcon(context.packageManager),
+            isShared = metadata.isShared,
+            signatureHash = metadata.signatureHash,
+            repoName = metadata.repoName,
+        )
+        return LoadResult.Success(extension)
+    }
+
+    private suspend fun loadExtensionFromPkg(
+        context: Context,
+        extensionInfo: ExtensionInfo,
+        extRepos: List<ExtensionRepo>?,
+    ): LoadResult {
         val repos = extRepos ?: getExtensionRepo.getAll()
-        // KMK <--
         val pkgManager = context.packageManager
         val pkgInfo = extensionInfo.packageInfo
         val appInfo = pkgInfo.applicationInfo!!
@@ -287,13 +383,11 @@ internal object ExtensionLoader {
                 versionCode,
                 libVersion,
                 signatures.last(),
-                // KMK -->
                 repoName = repos.firstOrNull { repo ->
                     signatures.all { it == repo.signingKeyFingerprint }
                 }?.let { repo ->
                     repo.shortName.takeIf { !it.isNullOrBlank() } ?: repo.name
                 },
-                // KMK <--
             )
             logcat(LogPriority.WARN) { "Extension $pkgName isn't trusted" }
             return LoadResult.Untrusted(extension)
@@ -312,7 +406,7 @@ internal object ExtensionLoader {
             return LoadResult.Error
         }
 
-        val sources = appInfo.metaData.getString(METADATA_SOURCE_CLASS)!!
+        val sourceClasses = appInfo.metaData.getString(METADATA_SOURCE_CLASS)!!
             .split(";")
             .map {
                 val sourceClass = it.trim()
@@ -322,18 +416,53 @@ internal object ExtensionLoader {
                     sourceClass
                 }
             }
-            .flatMap {
-                try {
-                    when (val obj = Class.forName(it, false, classLoader).getDeclaredConstructor().newInstance()) {
-                        is Source -> listOf(obj)
-                        is SourceFactory -> obj.createSources()
-                        else -> throw Exception("Unknown source class type: ${obj.javaClass}")
+
+        val sources = mutableListOf<Source>()
+        val extensionSources = mutableListOf<ExtensionSource>()
+
+        sourceClasses.forEach { className ->
+            try {
+                when (val obj = Class.forName(className, false, classLoader).getDeclaredConstructor().newInstance()) {
+                    is Source -> {
+                        sources.add(obj)
+                        extensionSources.add(ExtensionSource(pkgName, obj.id, obj.name, obj.lang, className))
                     }
-                } catch (e: Throwable) {
-                    logcat(LogPriority.ERROR, e) { "Extension load error: $extName ($it)" }
-                    return LoadResult.Error
+                    is SourceFactory -> {
+                        val factorySources = obj.createSources()
+                        sources.addAll(factorySources)
+                        factorySources.forEach {
+                            extensionSources.add(ExtensionSource(pkgName, it.id, it.name, it.lang, className))
+                        }
+                    }
+                    else -> throw Exception("Unknown source class type: ${obj.javaClass}")
                 }
+            } catch (e: Throwable) {
+                logcat(LogPriority.ERROR, e) { "Extension load error: $extName ($className)" }
+                return LoadResult.Error
             }
+        }
+
+        val repoName = repos.firstOrNull { repo ->
+            signatures.all { it == repo.signingKeyFingerprint }
+        }?.let { repo ->
+            repo.shortName.takeIf { !it.isNullOrBlank() } ?: repo.name
+        }
+
+        val metadata = ExtensionMetadata(
+            pkgName = pkgName,
+            name = extName,
+            versionName = versionName,
+            versionCode = versionCode,
+            libVersion = libVersion,
+            signatureHash = signatures.last(),
+            isNsfw = isNsfw,
+            isShared = extensionInfo.isShared,
+            repoName = repoName,
+            pkgFactory = appInfo.metaData.getString(METADATA_SOURCE_FACTORY),
+            lastModified = extensionInfo.lastModified,
+            sources = extensionSources,
+        )
+        extensionMetadataRepository.insertMetadata(metadata)
 
         val langs = sources.filterIsInstance<CatalogueSource>()
             .map { it.lang }
@@ -353,17 +482,11 @@ internal object ExtensionLoader {
             lang = lang,
             isNsfw = isNsfw,
             sources = sources,
-            pkgFactory = appInfo.metaData.getString(METADATA_SOURCE_FACTORY),
+            pkgFactory = metadata.pkgFactory,
             icon = appInfo.loadIcon(pkgManager),
             isShared = extensionInfo.isShared,
-            // KMK -->
             signatureHash = signatures.last(),
-            repoName = repos.firstOrNull { repo ->
-                signatures.all { it == repo.signingKeyFingerprint }
-            }?.let { repo ->
-                repo.shortName.takeIf { !it.isNullOrBlank() } ?: repo.name
-            },
-            // KMK <--
+            repoName = repoName,
         )
         return LoadResult.Success(extension)
     }
@@ -437,5 +560,6 @@ internal object ExtensionLoader {
     private data class ExtensionInfo(
         val packageInfo: PackageInfo,
         val isShared: Boolean,
+        val lastModified: Long,
     )
 }

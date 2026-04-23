@@ -25,6 +25,8 @@ import eu.kanade.domain.track.interactor.AddTracks
 import eu.kanade.domain.track.interactor.RefreshTracks
 import eu.kanade.domain.track.interactor.SyncChapterProgressWithTrack
 import eu.kanade.domain.track.interactor.TrackChapter
+import eu.kanade.domain.extension.repository.ExtensionMetadataRepository
+import eu.kanade.tachiyomi.data.extension.ExtensionMetadataRepositoryImpl
 import mihon.data.repository.ExtensionRepoRepositoryImpl
 import mihon.domain.chapter.interactor.FilterChaptersForDownload
 import mihon.domain.extensionrepo.interactor.CreateExtensionRepo
@@ -197,6 +199,7 @@ class DomainModule : InjektModule {
         addFactory { ToggleSourcePin(get()) }
         addFactory { TrustExtension(get(), get()) }
 
+        addSingletonFactory<ExtensionMetadataRepository> { ExtensionMetadataRepositoryImpl(get()) }
         addSingletonFactory<ExtensionRepoRepository> { ExtensionRepoRepositoryImpl(get()) }
         addFactory { ExtensionRepoService(get(), get()) }
         addFactory { GetExtensionRepo(get()) }

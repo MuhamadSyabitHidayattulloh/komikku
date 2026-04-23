@@ -39,9 +39,11 @@ import nl.adaptivity.xmlutil.serialization.XML
 import tachiyomi.core.common.storage.AndroidStorageFolderProvider
 import tachiyomi.core.common.storage.UniFileTempFileManager
 import tachiyomi.data.AndroidDatabaseHandler
+import tachiyomi.data.BooleanColumnAdapter
 import tachiyomi.data.Database
 import tachiyomi.data.DatabaseHandler
 import tachiyomi.data.DateColumnAdapter
+import tachiyomi.data.Extension_metadata
 import tachiyomi.data.History
 import tachiyomi.data.Mangas
 import tachiyomi.data.StringListColumnAdapter
@@ -119,6 +121,12 @@ class AppModule(val app: Application) : InjektModule {
                 mangasAdapter = Mangas.Adapter(
                     genreAdapter = StringListColumnAdapter,
                     update_strategyAdapter = UpdateStrategyColumnAdapter,
+                    favoriteAdapter = BooleanColumnAdapter,
+                    initializedAdapter = BooleanColumnAdapter,
+                ),
+                extension_metadataAdapter = Extension_metadata.Adapter(
+                    is_nsfwAdapter = BooleanColumnAdapter,
+                    is_sharedAdapter = BooleanColumnAdapter,
                 ),
             )
         }

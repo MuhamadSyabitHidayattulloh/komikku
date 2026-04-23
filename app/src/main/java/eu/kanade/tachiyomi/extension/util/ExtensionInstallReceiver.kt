@@ -46,6 +46,8 @@ internal class ExtensionInstallReceiver(private val listener: Listener) : Broadc
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent == null) return
 
+        val extensionMetadataRepository: eu.kanade.domain.extension.repository.ExtensionMetadataRepository by uy.kohesive.injekt.injectLazy()
+
         when (intent.action) {
             Intent.ACTION_PACKAGE_ADDED, ACTION_EXTENSION_ADDED -> {
                 if (isReplacing(intent)) return
@@ -72,7 +74,10 @@ internal class ExtensionInstallReceiver(private val listener: Listener) : Broadc
 
                 val pkgName = getPackageNameFromIntent(intent)
                 if (pkgName != null) {
-                    listener.onPackageUninstalled(pkgName)
+                    scope.launch {
+                        extensionMetadataRepository.deleteMetadata(pkgName)
+                        listener.onPackageUninstalled(pkgName)
+                    }
                 }
             }
         }
